@@ -70,7 +70,6 @@ func (microBatch MicroBatch[Job, JobResult]) Start(ctx context.Context, inChanne
 	var batch []Job
 	var timerChannel <-chan time.Time
 	var wg sync.WaitGroup
-	var lock sync.Mutex
 	fmt.Println("starting batch processing, listening for jobs...")
 	for {
 		select {
@@ -82,10 +81,9 @@ func (microBatch MicroBatch[Job, JobResult]) Start(ctx context.Context, inChanne
 					}
 					batch = append(batch, job)
 					if len(batch) == microBatch.Configuration.Size {
-						lock.Lock()
+						timerChannel = nil
 						microBatch.sendBatch(cancelableContext, &wg, &batch, outChannel)
 						batch = make([]Job, 0)
-						lock.Unlock()
 					}
 				} else {
 					timerChannel = nil
@@ -95,18 +93,14 @@ func (microBatch MicroBatch[Job, JobResult]) Start(ctx context.Context, inChanne
 		case <-timerChannel:
 			{
 				timerChannel = nil
-				lock.Lock()
 				microBatch.sendBatch(cancelableContext, &wg, &batch, outChannel)
 				batch = make([]Job, 0)
-				lock.Unlock()
 			}
 		case shutDown = <-microBatch.shutDownChannel:
 			{
 				timerChannel = nil
-				lock.Lock()
 				microBatch.sendBatch(cancelableContext, &wg, &batch, outChannel)
 				batch = make([]Job, 0)
-				lock.Unlock()
 			}
 		}
 		if shutDown {
