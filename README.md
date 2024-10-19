@@ -6,19 +6,30 @@ Implemented with a frequency and a size.
 The process will send when either the frequency expires after the first received job or when the size is reached.
 
 # Usage
+## General Process
+1. implement the `BatchProcessor` interface, this will take an array of type `Job` and return an array of `JobResult`.
+2. implement the `Job` and `JobResult` interfaces
+   - any struct implementing the `Job` interface is required to implement `func Id() string`
+   - the `JobResult` is required to implement the function `func JobId() string` 
+   - this is so `Job` and `JobResults` can be matched together for returning. 
+3. after implementing an appropriate processor, pass this into `batchy.NewMicroBatch` to create a new batchy micro batch
+   - with configuration as required for your process you must configure a size > 0 and non nil frequency 
+4. call MicroBatch.Start() to start consuming and processing jobs
+5. call the ProcessJob function with a single `Job` and the `JobResult` will be returned when the job has been processed
 
-First implement the `BatchProcessor` interface, this will take an array of type `Job` (in effect interface{}),
-It will return a processed array of `JobResult` (also interface{}) so in effect any type can be used.
-`Job` and `JobResult` are generic, but named this way to provide meaning to the generics that would otherwise be used.
+## Important Notes
+If the id/jobId do not match or if they are non-unique, then they will not get the `JobResult` matching up to the `Job` and then no result will be returned.
+Or could be returned to the wrong `Job` if the id is non-unique
 
-See this example where we implement a Doubler which will double the passed in ExampleJobs 'I' value. Returning an
-ExampleJobResult which contains I and a Doubled result value.
-See the code for this example in the [doubler_example.go](examples/doubler_example.go)
-It is important to monitor the `ctx.Done()` channel as if the MicroBatch is shutdown it will cancel the context
+It is important to monitor the `ctx.Done()` channel in the `BatchProcessor` as if the MicroBatch is shutdown it will cancel the context
 associated with any running BatchProcessors.
 
-After implementing an appropriate processor, pass this into a new MicroBatch, with configuration as required for your
-use case.
+## Example
+See this example where we implement the `BatchProcessor` as a `Doubler` which will double the passed in `ExampleJobs` 'I' value. Returning an
+`ExampleJobResult` which contains I and a `Doubled` result value.
+See the code for this example in the [doubler_example.go](examples/doubler_example.go)
+
+Note how the `Doubler.Process` func fills out the `ExampleJob` and `ExampleJobResult` id and jobId appropriately.
 
 Full Doubler example:
 ```go
@@ -33,12 +44,22 @@ import (
 )
 
 type ExampleJob struct {
-	I int
+	id string
+	I  int
+}
+
+func (exampleJob ExampleJob) Id() string {
+	return exampleJob.id
 }
 
 type ExampleJobResult struct {
+	jobId   string
 	I       int
 	Doubled int
+}
+
+func (exampleJobResult ExampleJobResult) JobId() string {
+	return exampleJobResult.jobId
 }
 
 type Doubler struct{} // example batch processor
@@ -50,6 +71,7 @@ func (Doubler) Process(ctx context.Context, jobs []ExampleJob) (jobResult []Exam
 		result := make([]ExampleJobResult, len(jobs))
 		for i, job := range jobs {
 			result[i] = ExampleJobResult{
+				jobId:   job.Id(),
 				I:       job.I,
 				Doubled: job.I * 2,
 			}
@@ -74,9 +96,6 @@ func (Doubler) Process(ctx context.Context, jobs []ExampleJob) (jobResult []Exam
 }
 
 func RunDoubler() {
-	inChannel := make(chan ExampleJob)
-	outChannel := make(chan []ExampleJobResult)
-
 	frequency := 30 * time.Millisecond
 	microBatch, err := batchy.NewMicroBatch(batchy.MicroBatchConfig[ExampleJob, ExampleJobResult]{
 		Size:           4,
@@ -89,52 +108,36 @@ func RunDoubler() {
 	}
 	var wg sync.WaitGroup
 
-	// handle batch results
-	go func() {
-		for jobResultBatch := range outChannel {
-			// process the result array here
-			for _, jobResult := range jobResultBatch {
-				fmt.Printf("doubled %d to %d", jobResult.I, jobResult.Doubled)
-			}
-		}
-	}()
-
 	// call Start so the MicroBatch will listen
 	wg.Add(1)
 	go func() {
 		// if you wanted to send some context/state to the processor
 		// this could be done via the context
-		microBatch.Start(context.Background(), inChannel, outChannel)
+		microBatch.Start(context.Background())
 		wg.Done()
 	}()
 
-	// send jobs into the inChannel
-	go func() {
-		// you could source your job from anywhere, this is just a contrived example
-		// submit a single job
-		job := ExampleJob{
-			I: 5,
-		}
+	// you could source your job from anywhere, this is just a contrived example
+	// submit a single job
+	for i := 0; i < 10; i++ {
+		result := microBatch.ProcessJob(ExampleJob{
+			id: fmt.Sprintf("%d-%d", time.Nanosecond, i),
+			I:  i,
+		}).Doubled
+		fmt.Printf("doubled %d to %d\n", i, result)
+	}
 
-		inChannel <- job
-
-		// finished sending jobs, time to shut down
-		microBatch.ShutDown()
-	}()
-
+	// finished sending jobs, time to shut down
+	microBatch.ShutDown()
 	wg.Wait()
 }
 ```
-
-Additionally provide the in and out channel to send in Jobs and receive the JobResults. Results are returned in batches.
-If you want to track which Job is related to which result, make sure you implement it in the BatchProcessor.
-Any additional configuration or state can be provided to the context.
 
 # Development
 Use the `./scripts/check.sh` script to run go check and lint targets
 
 # Out of scope
-- just used println for convenience given this is an example library rather than a production grade logging library
+- just used print functions to log for convenience given this is an example library
 - no extensive error handling for this example code
 - didn't publish this to anywhere so `go get` will not work
-- consider a worker pool for the BatchProcessor go routines. Not sure if this necessary but depending on the BatchProcessor, memory and cpu usage could be a problem eventually.
+- consider a worker pool or go routine limit for the `BatchProcessor` go routines. Not sure if this necessary but depending on the BatchProcessor, memory and cpu usage could be a problem eventually.

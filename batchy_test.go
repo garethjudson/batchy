@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/stretchr/testify/assert"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -46,7 +47,7 @@ func TestNewMicroBatch_ErrorOnNegativeSize(t *testing.T) {
 
 func TestBatchyProcess_TimeBatchingSuccess(t *testing.T) {
 	timerTriggers := []int{1, 2}
-	returnedJobGroups, cleanlyShutdown := runTestBatch(t, 7, 4, &timerTriggers)
+	returnedJobGroups, cleanlyShutdown := runInternalTestBatch(t, 7, 4, &timerTriggers)
 
 	assert.True(t, cleanlyShutdown)
 	assert.Len(t, *returnedJobGroups, 3)
@@ -56,7 +57,7 @@ func TestBatchyProcess_TimeBatchingSuccess(t *testing.T) {
 }
 
 func TestBatchyProcess_SizeBatchingSuccess(t *testing.T) {
-	returnedJobGroups, cleanlyShutdown := runTestBatch(t, 8, 4, nil)
+	returnedJobGroups, cleanlyShutdown := runInternalTestBatch(t, 8, 4, nil)
 
 	assert.True(t, cleanlyShutdown)
 	assert.Len(t, *returnedJobGroups, 2)
@@ -66,13 +67,63 @@ func TestBatchyProcess_SizeBatchingSuccess(t *testing.T) {
 
 func TestBatchyProcess_TimeAndSizeBatchingSuccess(t *testing.T) {
 	timerTriggers := []int{6, 8}
-	returnedJobGroups, cleanlyShutdown := runTestBatch(t, 9, 4, &timerTriggers)
+	returnedJobGroups, cleanlyShutdown := runInternalTestBatch(t, 9, 4, &timerTriggers)
 
 	assert.True(t, cleanlyShutdown)
 	assert.Len(t, *returnedJobGroups, 3)
 	assert.Len(t, (*returnedJobGroups)[0], 4)
 	assert.Len(t, (*returnedJobGroups)[1], 3)
 	assert.Len(t, (*returnedJobGroups)[2], 2)
+}
+
+func TestProcessJob_Success(t *testing.T) {
+	frequency := 50 * time.Millisecond
+	shutdownTimeout := time.Millisecond * 1000
+	microBatch, err := NewMicroBatch(MicroBatchConfig[TestJob, TestJobResult]{
+		Size:            1,
+		Frequency:       &frequency,
+		BatchProcessor:  TestBatchProcessor{},
+		ShutdownTimeout: &shutdownTimeout,
+	})
+	assert.NoError(t, err)
+
+	microBatch.Start(context.Background())
+
+	lock := sync.Mutex{}
+	results := make([]JobResult, 0)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		for i := 0; i < 100; i++ {
+			result := microBatch.ProcessJob(TestJob{
+				Number: i,
+			})
+			lock.Lock()
+			results = append(results, result)
+			lock.Unlock()
+		}
+		wg.Done()
+	}()
+
+	wg.Add(1)
+	go func() {
+		for i := 300; i < 400; i++ {
+			result := microBatch.ProcessJob(TestJob{
+				Number: i,
+			})
+			lock.Lock()
+			results = append(results, result)
+			lock.Unlock()
+		}
+		wg.Done()
+	}()
+
+	wg.Wait()
+	cleanlyShutdown := microBatch.ShutDown()
+
+	assert.True(t, cleanlyShutdown)
+	assert.Len(t, results, 200)
 }
 
 func TestCloseInChannel(t *testing.T) {
@@ -89,14 +140,13 @@ func TestCloseInChannel(t *testing.T) {
 	})
 	// in our test this shouldn't happen
 	assert.NoError(t, err)
-
+	_, cancel := context.WithCancel(context.Background())
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	go func() {
-		microBatch.Start(context.Background(), inChannel, outChannel)
+		microBatch.startProcessing(context.Background(), inChannel, outChannel, cancel)
 		wg.Done()
 	}()
-
 	close(inChannel)
 	wg.Wait()
 	// not sure what to assert here
@@ -128,7 +178,8 @@ func TestShutdown(t *testing.T) {
 	}
 
 	go func() {
-		microBatch.Start(context.Background(), inChannel, outChannel)
+		_, cancel := context.WithCancel(context.Background())
+		microBatch.startProcessing(context.Background(), inChannel, outChannel, cancel)
 	}()
 
 	inChannel <- TestJob{
@@ -138,7 +189,8 @@ func TestShutdown(t *testing.T) {
 	assert.False(t, cleanlyShutdown) // shutdown completed due to timeout
 }
 
-func runTestBatch(t *testing.T, jobCount, size int, timerTriggers *[]int) (*[][]TestJobResult, bool) {
+// uses the internal startProcessing, so we can verify the batches were processed in the way we expect
+func runInternalTestBatch(t *testing.T, jobCount, size int, timerTriggers *[]int) (*[][]TestJobResult, bool) {
 	jobs := makeTestJobs(jobCount)
 
 	inChannel := make(chan TestJob)
@@ -161,7 +213,8 @@ func runTestBatch(t *testing.T, jobCount, size int, timerTriggers *[]int) (*[][]
 	}
 
 	go func() {
-		microBatch.Start(context.Background(), inChannel, outChannel)
+		_, cancel := context.WithCancel(context.Background())
+		microBatch.startProcessing(context.Background(), inChannel, outChannel, cancel)
 	}()
 
 	// provide jobs synchronously otherwise the return order is not guaranteed
@@ -219,8 +272,16 @@ type TestJobResult struct {
 	ReturnedAt time.Time
 }
 
+func (testJobResult TestJobResult) JobId() string {
+	return strconv.Itoa(testJobResult.JobNumber)
+}
+
 type TestJob struct {
 	Number int
+}
+
+func (testJob TestJob) Id() string {
+	return strconv.Itoa(testJob.Number)
 }
 
 type TestBatchProcessor struct{}

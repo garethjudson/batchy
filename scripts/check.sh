@@ -10,4 +10,4 @@ echo "Check format ..."
 gofmt -l "."
 
 echo "Run Tests ..."
-go test "./..."
+go test "./..." -coverpkg=github.com/garethjudson/batchy
