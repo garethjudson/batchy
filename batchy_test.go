@@ -5,18 +5,19 @@ import (
 	"fmt"
 	"github.com/stretchr/testify/assert"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 )
 
 func TestNewMicroBatch_ErrorOnNilFrequency(t *testing.T) {
 	_, err := NewMicroBatch(MicroBatchConfig[TestJob, TestJobResult]{
-		Size:           0,
-		Frequency:      nil,
+		Size:           1,
 		BatchProcessor: TestBatchProcessor{},
 	})
 	// in our test this shouldn't happen
 	assert.Error(t, err)
+	assert.Equal(t, "frequency must not be nil", err.Error())
 }
 
 func TestNewMicroBatch_ErrorOnZeroSize(t *testing.T) {
@@ -28,6 +29,7 @@ func TestNewMicroBatch_ErrorOnZeroSize(t *testing.T) {
 	})
 	// in our test this shouldn't happen
 	assert.Error(t, err)
+	assert.Equal(t, "size must be greater than zero", err.Error())
 }
 
 func TestNewMicroBatch_ErrorOnNegativeSize(t *testing.T) {
@@ -39,13 +41,14 @@ func TestNewMicroBatch_ErrorOnNegativeSize(t *testing.T) {
 	})
 	// in our test this shouldn't happen
 	assert.Error(t, err)
+	assert.Equal(t, "size must be greater than zero", err.Error())
 }
 
 func TestBatchyProcess_TimeBatchingSuccess(t *testing.T) {
 	timerTriggers := []int{1, 2}
-	returnedJobGroups, ok := runTestBatch(t, 7, 4, &timerTriggers)
+	returnedJobGroups, cleanlyShutdown := runTestBatch(t, 7, 4, &timerTriggers)
 
-	assert.True(t, ok)
+	assert.True(t, cleanlyShutdown)
 	assert.Len(t, *returnedJobGroups, 3)
 	assert.Len(t, (*returnedJobGroups)[0], 2)
 	assert.Len(t, (*returnedJobGroups)[1], 1)
@@ -53,9 +56,9 @@ func TestBatchyProcess_TimeBatchingSuccess(t *testing.T) {
 }
 
 func TestBatchyProcess_SizeBatchingSuccess(t *testing.T) {
-	returnedJobGroups, ok := runTestBatch(t, 8, 4, nil)
+	returnedJobGroups, cleanlyShutdown := runTestBatch(t, 8, 4, nil)
 
-	assert.True(t, ok)
+	assert.True(t, cleanlyShutdown)
 	assert.Len(t, *returnedJobGroups, 2)
 	assert.Len(t, (*returnedJobGroups)[0], 4)
 	assert.Len(t, (*returnedJobGroups)[1], 4)
@@ -63,13 +66,43 @@ func TestBatchyProcess_SizeBatchingSuccess(t *testing.T) {
 
 func TestBatchyProcess_TimeAndSizeBatchingSuccess(t *testing.T) {
 	timerTriggers := []int{6, 8}
-	returnedJobGroups, ok := runTestBatch(t, 9, 4, &timerTriggers)
+	returnedJobGroups, cleanlyShutdown := runTestBatch(t, 9, 4, &timerTriggers)
 
-	assert.True(t, ok)
+	assert.True(t, cleanlyShutdown)
 	assert.Len(t, *returnedJobGroups, 3)
 	assert.Len(t, (*returnedJobGroups)[0], 4)
 	assert.Len(t, (*returnedJobGroups)[1], 3)
 	assert.Len(t, (*returnedJobGroups)[2], 2)
+}
+
+func TestCloseInChannel(t *testing.T) {
+	inChannel := make(chan TestJob)
+	outChannel := make(chan []TestJobResult, 1)
+
+	frequency := 30 * time.Second // the frequency doesn't matter as our timer channel is mocked
+	shutdownTimeout := time.Millisecond * 1000
+	microBatch, err := NewMicroBatch(MicroBatchConfig[TestJob, TestJobResult]{
+		Size:            1,
+		Frequency:       &frequency,
+		BatchProcessor:  TestNeverDoneProcessor{},
+		ShutdownTimeout: &shutdownTimeout,
+	})
+	// in our test this shouldn't happen
+	assert.NoError(t, err)
+
+	wg := sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		microBatch.Start(context.Background(), inChannel, outChannel)
+		wg.Done()
+	}()
+
+	close(inChannel)
+	wg.Wait()
+	// not sure what to assert here
+	// getting passed the wait group would mean the close shutdown cleanly
+	cleanlyShutdown := microBatch.ShutDown()
+	assert.True(t, cleanlyShutdown)
 }
 
 func TestShutdown(t *testing.T) {
@@ -101,8 +134,8 @@ func TestShutdown(t *testing.T) {
 	inChannel <- TestJob{
 		Number: 0,
 	}
-	ok := microBatch.ShutDown()
-	assert.False(t, ok) // shutdown completed due to timeout
+	cleanlyShutdown := microBatch.ShutDown()
+	assert.False(t, cleanlyShutdown) // shutdown completed due to timeout
 }
 
 func runTestBatch(t *testing.T, jobCount, size int, timerTriggers *[]int) (*[][]TestJobResult, bool) {
@@ -144,13 +177,13 @@ func runTestBatch(t *testing.T, jobCount, size int, timerTriggers *[]int) (*[][]
 		}
 	}
 
-	jobBatches, ok := collectJobsBatches(microBatch, outChannel, len(*jobs))
+	jobBatches, cleanlyShutdown := collectJobsBatches(microBatch, outChannel, len(*jobs))
 
 	if fakeTimerChannel != nil {
 		close(fakeTimerChannel)
 	}
 
-	return jobBatches, ok
+	return jobBatches, cleanlyShutdown
 }
 
 func makeTestJobs(number int) *[]TestJob {
@@ -166,7 +199,7 @@ func makeTestJobs(number int) *[]TestJob {
 // collectJobsBatches into a slice
 // there is very likely a smarter way to test this, just doing something quick to verify
 func collectJobsBatches(microBatch *MicroBatch[TestJob, TestJobResult], outChannel chan []TestJobResult, expectedJobCount int) (*[][]TestJobResult, bool) {
-	ok := false
+	cleanlyShutdown := false
 	jobGroups := make([][]TestJobResult, 0)
 	resultCounter := 0
 	for jobResult := range outChannel {
@@ -175,10 +208,10 @@ func collectJobsBatches(microBatch *MicroBatch[TestJob, TestJobResult], outChann
 		jobGroups = append(jobGroups, jobResult)
 		resultCounter += count
 		if resultCounter >= expectedJobCount {
-			ok = microBatch.ShutDown()
+			cleanlyShutdown = microBatch.ShutDown()
 		}
 	}
-	return &jobGroups, ok
+	return &jobGroups, cleanlyShutdown
 }
 
 type TestJobResult struct {

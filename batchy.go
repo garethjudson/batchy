@@ -42,10 +42,10 @@ type BatchProcessor[Job interface{}, JobResult interface{}] interface {
 func NewMicroBatch[Job interface{}, JobResult interface{}](configuration MicroBatchConfig[Job, JobResult]) (*MicroBatch[Job, JobResult], error) {
 	// could replace with sensible defaults
 	if configuration.Size < 1 {
-		return nil, errors.New("configuration.Size must be greater than zero")
+		return nil, errors.New("size must be greater than zero")
 	}
 	if configuration.Frequency == nil {
-		return nil, errors.New("configuration.Frequency must not be nil")
+		return nil, errors.New("frequency must not be nil")
 	}
 
 	return &MicroBatch[Job, JobResult]{
@@ -115,16 +115,10 @@ func (microBatch MicroBatch[Job, JobResult]) Start(ctx context.Context, inChanne
 	}
 
 	fmt.Println("waiting for BatchProcessors to complete...")
-	ok := waitWithTimeout(&wg, shutdownTimeout) // wait for go funcs to complete
-	cancel()                                    // call cancel for ctx
-	close(outChannel)                           // close out channel
-
-	if !ok {
-		// return error
-		microBatch.shutDownCompleteChannel <- false
-	} else {
-		microBatch.shutDownCompleteChannel <- true
-	}
+	completedWithinTimeout := waitWithTimeout(&wg, shutdownTimeout) // wait for go funcs to complete
+	cancel()                                                        // call cancel for ctx
+	close(outChannel)                                               // close out channel
+	microBatch.shutDownCompleteChannel <- completedWithinTimeout
 }
 
 func (microBatch MicroBatch[Job, JobResult]) sendBatch(
@@ -145,12 +139,12 @@ func (microBatch MicroBatch[Job, JobResult]) sendBatch(
 // ShutDown gracefully shut down the MicroBatch, finish processing any currently running BatchProcessor instances
 func (microBatch MicroBatch[Job, JobResult]) ShutDown() bool {
 	microBatch.shutDownChannel <- true
-	ok := <-microBatch.shutDownCompleteChannel
+	cleanlyShutdown := <-microBatch.shutDownCompleteChannel
 
 	close(microBatch.shutDownCompleteChannel)
 	close(microBatch.shutDownChannel)
 
-	return ok
+	return cleanlyShutdown
 }
 
 func waitWithTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
@@ -164,6 +158,7 @@ func waitWithTimeout(wg *sync.WaitGroup, timeout time.Duration) bool {
 	select {
 	case <-time.After(timeout):
 		{
+			fmt.Printf("BatchProcessors did not complete in %d milliseconds, could likely there are leaky go routines\n", timeout.Milliseconds())
 			return false
 		}
 	case <-done:
